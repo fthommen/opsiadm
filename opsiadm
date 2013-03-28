@@ -1,0 +1,291 @@
+#!/usr/bin/perl
+
+# print unbuffered
+$| = 1;
+
+
+#
+# operational defaults
+#
+$verbose = 0;
+$dummy = 0;
+$interactive = 1;
+
+
+$clHost = "";
+
+while ( my $i = shift @ARGV ) {
+  ($i eq '-h')          && do {$clHost=shift @ARGV; next};
+  ($i =~ /--host=(.+)/) && do {$clHost=$1; next};
+  ($i eq '--help')      && do {print_help(); exit};
+  $clCmd = $i ; $clArgs = "@ARGV"; last;
+}
+
+
+print "\nRunning command $clCmd with arguments $clArgs\n\n";
+
+# use strict;
+
+print "--- OPSI admin ---\n";
+
+$cmd_opsi_admin = "/usr/bin/opsi-admin";
+$cmd_opsi_admin_getClients = "$cmd_opsi_admin -d method getClients_listOfHashes";
+
+print "$cmd_opsi_admin -- $cmd_opsi_admin_getClients\n";
+
+@pkgs = ();
+
+
+
+if ($clCmd eq "install") {
+  my ($p, $h, $d) = split(/\s+/, $clArgs);
+  print "PACKAGE: $p\n";
+  print "HOST: $h\n";
+    
+} elsif ($clCmd eq "upgrade") {
+
+
+} elsif ($clCmd eq "sidegrade") {
+
+} else {
+
+  print "\nUnknown command $clCmd\n\n";
+
+}
+
+print "P $p\n";
+
+exit;
+
+
+
+
+
+
+
+
+#
+# ------------------------------------------------------------------
+#
+
+sub readPackages {
+  my @pkgs = ();
+
+  open (OA, "$cmd_opsi_admin -d method getLocalBootProductIds_list|") || die "ERROR\n";
+  print "Reading in all LocalBoot packages";
+  while (<OA>) {
+    chomp;
+    push (@pkgs, $1) if /"([^"]+)"/;
+    print ".";
+  }
+  close (OA);
+  print "\n";
+  
+  @main::pkgs = sort(@pkgs);
+
+}
+
+
+sub listPackages {
+  print "\n\n---------------------\n\n";
+  foreach (@pkgs) {
+    print " * $_\n";
+  }
+}
+
+
+
+sub readHosts {
+
+  my $in_host = 0;
+  my $host    = "";
+
+  if ($clHost) {
+     open (OA, "$cmd_opsi_admin -d method getHost_hash $clHost|") || die "ERROR";
+  } else {
+     open (OA, "$cmd_opsi_admin -d method getClients_listOfHashes|") || die "ERROR";
+  }
+
+  print "Reading in all hosts";
+
+  while (<OA>) {
+    chomp;
+    $in_host = 1 if /.*\{/;
+    $in_host = 0 if /.*\}/;
+    # print "SKIPPING ($_)\n" if !$in_host;
+    next if !$in_host;
+    # "hostId" : "pc-gavin-05.embl.de",
+    if ( /"hostId" : "([^"]+)",/ ) {
+      $host = $1;
+      print ".";
+      if (exists $hosts{$host}) {
+        print STDERR "WARNING: Duplicate entry for $host found\n"
+      }
+    }
+  
+    # "description" : "GAVIN"
+    /"description" : "([^"]+)"/ && do{ %{$hosts{$host}} = ("description" => $1) };
+
+    # print "  * $_\n";
+    #print ".";
+  }
+
+  close (OA);
+  print "\n";
+
+}
+
+
+#
+# Read packages status through web/database api
+#
+sub readPackagesStatus1 {
+  my $host   = "";
+  my $in_pkg = 0;
+
+  my $status = "";
+  my $pkg = "";
+
+# opsi-admin -d method getLocalBootProductStates_hash pc-cmueller-11
+
+  print "Reading in all packages";
+
+  foreach $host (keys %hosts) {
+    open (OA, "$cmd_opsi_admin -d method getLocalBootProductStates_hash $host|") || die "ERROR";
+    while (<OA>) {
+      chomp;
+      $in_pkg = 1 if /.*\{/;
+      if ( /.*\}/ ) {
+#        print ".";
+
+        if (exists $hosts{$host}{pkg}{$pkg}) {
+          print STDERR "WARNING: Duplicate package $pkg for host $host detected!\n";
+        }
+
+        $hosts{$host}{pkg}{$pkg}{"status"} = $status if $pkg && $status;
+        $pkg = "";
+        $status = "";
+        $in_pkg = 0;
+      }
+      # print "SKIPPING PACKAGE ($_)\n" if !$in_pkg;
+
+      # "installationStatus" : "not_installed",
+      $status = $1 if /"installationStatus" : "([^"]+)"/;
+      # "productId" : "embl-thunderbird-3"
+      $pkg = $1 if /"productId" : "([^"]+)"/;
+
+    }
+   
+    close (OA);
+#     print "\n";
+  }
+
+}
+
+
+#
+# Extract packages status from .ini files
+#
+sub readPackagesStatus2 {
+  my $h   = "";
+  my $status = "";
+  my $p   = "";
+  my %s   = ();
+
+
+  foreach $h (keys %hosts) {
+    %s = ();
+    $in_config = 0;
+    $status = "";
+
+    open (F, "/var/lib/opsi/config/clients/$h.ini") || die "ERR\n";
+    while (<F>) {
+      chomp;
+      $p = $1 if /\[(.*)-state\]/;
+      # targetconfiguration = installed
+      $s{$p} = $1 if /targetconfiguration = (.+)/;
+    }
+    close (F);
+
+    # now write the status list into the host config
+    foreach my $pkg (@pkgs) {
+      if (exists $s{$pkg}) {
+        $hosts{$h}{pkg}{$pkg}{"status"} = $s{$pkg};
+      } else {
+        $hosts{$h}{pkg}{$pkg}{"status"} = "not_installed"
+      }
+    }
+  }
+
+}
+
+
+#
+# Extract packages status from .ini files (corrected)
+#
+sub readPackagesStatus3 {
+  my $h   = "";
+  my $status = "";
+  my $p   = "";
+  my %s   = ();
+  my $in_section = 0;
+
+
+  foreach $h (keys %hosts) {
+    %s = ();
+    $in_config = 0;
+    $status = "";
+
+    open (F, "/var/lib/opsi/config/clients/$h.ini") || die "ERR\n";
+    while (<F>) {
+      chomp;
+      if (/\[([^]]+)\]/) {
+         if ($1 eq "localboot_product_states") {
+           $in_section = 1;
+         } else {
+           $in_section = 0
+         }
+      }
+      next if !$in_section;
+
+      # embl-mcafee-8 = installed:none
+      /(.*) = ([^:]+):([^:]+)/;
+      $s{$1} = $2;
+      
+      #$p = $1 if /\[(.*)-state\]/;
+      ## targetconfiguration = installed
+      #$s{$p} = $1 if /targetconfiguration = (.+)/;
+    }
+    close (F);
+
+    # now write the status list into the host config
+    foreach my $pkg (@pkgs) {
+      if (exists $s{$pkg}) {
+        $hosts{$h}{pkg}{$pkg}{"status"} = $s{$pkg};
+      } else {
+        $hosts{$h}{pkg}{$pkg}{"status"} = "not_installed"
+      }
+    }
+
+  }
+
+}
+
+
+
+ readHosts;
+ readPackages;
+ readPackagesStatus3;
+
+
+
+ foreach $a (sort keys %hosts) {
+   print "HOST: $a\n";
+   print "  ", $hosts{$a}{"description"}, "\n\n";
+   foreach $b (sort keys %{ $hosts{$a}{pkg} }) {
+     print "   $b: ", $hosts{$a}{pkg}{$b}{"status"}, "\n";
+   }
+   print "\n";
+ };
+
+print "done\n";
